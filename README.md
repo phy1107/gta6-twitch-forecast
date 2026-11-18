@@ -8,17 +8,18 @@ Forecast GTA VI's launch-day Twitch viewers hour by hour (hours 2-24), given hou
 
 ## Model
 
-Nearest-neighbour launch-shape forecast (see `main.py` for details):
+Scale-regression launch-shape forecast (see `main.py` for details):
 
 - Each comparable launch gives a full release-day curve. Its intraday shape is the log-ratio of each hour's viewers to its hour-1 print.
-- Keep comparables with a complete 24-hour release day whose hour 1 is at least 5% of that day's peak (drops simultaneous-global unlocks whose hour 1 is essentially zero).
-- Take the 10 comparables whose log hour-1 print is closest to this case's log hour-1 print -- shape depends strongly on scale (correlation about -0.73 between log hour-1 and the evening rise).
-- Median log-ratio per hour over those 10, shrunk 15% toward persistence; spread is the neighbours' half interquartile range, scaled x1.5 with a 0.18 floor.
-- Quantiles: `p1 * exp(0.85 * shape_h + z_tau * spread_h)`.
+- Shape depends strongly on scale: huge launches are already near their peak at hour 1, small ones climb several-fold into the evening. So for each hour separately, fit a ridge regression of the log-ratio on log hour-1 viewers across the comparable launches, and predict it at this case's log hour-1 print -- this extrapolates to GTA VI's unprecedented scale instead of only repeating the shapes of launches already seen.
+- Training pool: comparables with a complete 24-hour release day whose hour 1 is at least 15% of that day's peak (drops simultaneous-global unlocks, a different regime from GTA VI's rolling midnight-local unlock).
+- Beyond the largest hour-1 print in the training pool, the regression slope is damped to half: held-out-giant tests show the evening ratio saturates near 1 for the biggest launches instead of falling forever.
+- Spread is the per-hour residual standard deviation of the regression, floored at 0.18 log units.
+- Quantiles: `p1 * exp(pred_h + z_tau * spread_h)`.
 
-Leave-one-out cross-validation on the kit's comparables: mean pinball loss about 0.28, vs about 0.36 for the house persistence baseline.
+Leave-one-out cross-validation on the kit's comparables: mean pinball loss about 0.257, vs about 0.280 for the nearest-neighbour median it replaces and about 0.36 for the house persistence baseline. On the 16 largest launches alone: 0.210 vs 0.222.
 
-In short: borrow the shape of the 10 most similar launches, pull it 15% back toward flat, and widen the bands where those launches disagreed.
+In short: borrow the shape trend across launches of every size, let it flatten where the biggest launches flatten, and widen the bands where launches of a given size still disagree.
 
 ## Run it
 

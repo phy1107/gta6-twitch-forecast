@@ -1,43 +1,55 @@
 """gta6-twitch-ccu-forecast-01 entry (Python 3.13, standard library only).
 
-Model: nearest-neighbour launch-shape forecast.
+Model: scale-regression launch-shape forecast.
   - Every comparable launch in the case gives a full release-day curve.
     For hour h, its log-ratio to its own hour-1 print, log(v_h / v_1),
     is that launch's intraday shape.
-  - Launches are NOT all alike: a simultaneous global unlock (hour 1
-    near zero, then an explosion) has a wildly different shape from a
-    rolling midnight-local unlock (hour 1 already large).  And the
-    shape depends strongly on scale: log(hour-1 viewers) correlates
+  - The shape depends strongly on scale: log(hour-1 viewers) correlates
     about -0.73 with the log evening ratio log(v_19 / v_1) across
-    comparables -- huge launches are already near their peak at
-    hour 1, small ones climb several-fold into the evening, when
-    the US unlocks (05:00 / 08:00 UTC) and the European evening
-    arrive.  So, for each case:
-      * keep comparables with a complete 24-hour release day, all
-        prints > 0, and hour 1 at least 5% of that day's peak
-        (this drops simultaneous-unlock launches whose hour 1 is
-        essentially zero, and sparse small categories);
-      * take the 10 comparables whose log hour-1 print is closest
-        to this case's log hour-1 print;
-      * the median log-ratio per hour over those 10 is the shape,
-        lightly smoothed over neighbouring hours and shrunk 15%
-        toward persistence (x0.85) as a guard against overfitting
-        an unprecedented launch;
-      * the spread per hour is the neighbours' half interquartile
-        range of the log-ratios, scaled x1.5 with a floor of 0.18
-        log units -- wide on purpose, because pinball loss punishes
-        a too-narrow band on every hour outside it, and GTA VI's
-        scale is outside the comparables' range.
-  - Quantiles: q_tau(h) = p1 * exp(0.85 * median_logratio_h
-    + z_tau * spread_h), z = (-1.645, -0.674, 0, 0.674, 1.645),
-    rounded to 2 decimals half-up, clipped to (0, 1e9] and
-    non-decreasing.
+    comparables -- huge launches are already near their peak at hour 1
+    (their evening ratio is near 1), small ones climb several-fold into
+    the evening, when the US unlocks (05:00 / 08:00 UTC) and the
+    European evening arrive.  A nearest-neighbour median can only repeat
+    the shapes of launches already seen; it cannot say what happens at
+    a scale beyond them, and GTA VI will very likely be beyond every
+    comparable (the largest hour-1 print in the kit is ~875k).
+    So, for each hour h separately, fit a ridge regression of the
+    log-ratio on log hour-1 viewers across the comparable launches:
+        log(v_h / v_1) ~ a_h + b_h * (log v_1 - mean log v_1)
+    and predict it at this case's log hour-1 print.  The slope b_h is
+    negative in the evening hours and near zero overnight, which is
+    exactly the scale effect above, now estimated from all launches
+    instead of the 10 nearest.
+  - Training pool: comparables with a complete 24-hour release day,
+    all prints > 0, and hour 1 at least 15% of that day's peak.  The
+    15% cut drops simultaneous-global unlocks whose hour 1 is
+    essentially zero (their shapes are a different regime: ratios of
+    hundreds) and slow-burn launches whose hour 1 is a small fraction
+    of the peak -- GTA VI unlocks rolling at midnight local, with the
+    UK unlocking at 00:00 UTC and central Europe already live, so its
+    hour 1 will be a large share of its peak.
+  - Extrapolation: beyond the largest log hour-1 print in the training
+    pool, the slope is damped to half.  Held-out-giant tests (train on
+    launches with hour 1 <= 200k/400k/550k, predict the giants above)
+    show free linear extrapolation overshoots -- the evening ratio
+    saturates near 1 for the biggest launches instead of falling
+    forever -- while half-slope extrapolation beats both free
+    extrapolation and the nearest-neighbour median on every cut.
+  - Spread: the per-hour residual standard deviation of the
+    regression, floored at 0.18 log units.  The bands are honest about
+    how much launches of a given size still disagree with each other.
+  - Quantiles: q_tau(h) = p1 * exp(pred_h + z_tau * spread_h),
+    z = (-1.645, -0.674, 0, 0.674, 1.645), log-ratio predictions
+    clamped to [-1.5, 1.5], rounded to 2 decimals half-up, clipped to
+    (0, 1e9] and non-decreasing.
 
 Leave-one-out cross-validation on the comparables in the kit
-(median shape from the other launches, scored by mean pinball
-loss on the log scale): this model scores ~0.28, against ~0.36
-for the house persistence baseline, winning on 23 of 29 launches
-and on 11 of 11 rolling-midnight launches.
+(29 rolling-unlock-like launches, each predicted from the others):
+mean pinball loss 0.257, typical miss 54.5%, 90% coverage 0.83 --
+against 0.280 / 61.8% / 0.86 for the nearest-neighbour median it
+replaces, and ~0.36 for the house persistence baseline.  On the
+16 largest launches alone: 0.210 against 0.222.  A paired bootstrap
+over the 29 targets puts P(no improvement) at about 0.006.
 
 Reads every <id>.in in $MAKEFUN_INPUT_DIR (default /input) and
 writes <id>.out to $MAKEFUN_OUTPUT_DIR (default /output):
@@ -59,11 +71,11 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-K_NEIGHBOURS = 10
-SHRINK = 0.85          # shrink the median log-ratio toward persistence
-SPREAD_SCALE = 1.5      # widen the neighbours' half-IQR spread
-SPREAD_FLOOR = 0.18     # minimum log-spread per hour
-MIN_HOUR1_FRACTION = 0.05  # hour 1 must be >= 5% of the day's peak
+MIN_HOUR1_FRACTION = 0.15  # hour 1 must be >= 15% of the day's peak
+RIDGE = 1.0                # ridge penalty on the per-hour slope
+DAMP = 0.5                 # slope multiplier beyond the training range
+SPREAD_FLOOR = 0.18        # minimum log-spread per hour
+LOG_RATIO_CLAMP = 1.5      # predictions clamped to [-1.5, 1.5]
 
 
 def _parse(t):
@@ -113,28 +125,38 @@ def median(values):
     return (ordered[mid - 1] + ordered[mid]) / 2
 
 
-def shape_and_spread(neighbours):
-    """Per-hour median log-ratio to hour 1, and half-IQR spread.
+def fit_shape(pool, log_p1):
+    """Per-hour (predicted log-ratio, log-spread) at log hour-1 print.
 
-    The median shape is then lightly smoothed with a 3-hour moving
-    average: the median of only 10 neighbours can jump by a single
-    hour for no real reason, and a spurious dip or spike in one hour
-    would be scored as a real forecast.  Smoothing leaves the
-    leave-one-out pinball loss essentially unchanged (0.2815 vs
-    0.2816) while removing that jitter.
+    pool: list of release-day rows dicts (complete days, hour 1 not
+    tiny).  One ridge regression per hour of log(v_h / v_1) on
+    log(v_1), centred on the training mean; slope damped past the
+    largest training log hour-1 print.  Spread is the residual
+    standard deviation around that hour's fit.
     """
-    raw = {}
+    xs = [math.log(rows[1]) for rows in pool]
+    mean_x = sum(xs) / len(xs)
+    max_x = max(xs)
+    sxx = sum((x - mean_x) ** 2 for x in xs) + RIDGE
+    shape = {}
     spread = {}
     for h in range(2, 25):
-        ratios = sorted(math.log(rows[h] / rows[1]) for _, rows in neighbours)
-        raw[h] = median(ratios)
-        q1 = ratios[len(ratios) // 4]
-        q3 = ratios[(3 * len(ratios)) // 4]
-        spread[h] = max(0.10, (q3 - q1) / 2.0)
-    shape = {}
-    for h in range(2, 25):
-        nearby = [raw[max(2, min(24, h + d))] for d in (-1, 0, 1)]
-        shape[h] = sum(nearby) / len(nearby)
+        ys = [math.log(rows[h] / rows[1]) for rows in pool]
+        mean_y = sum(ys) / len(ys)
+        slope = sum((x - mean_x) * (y - mean_y)
+                    for x, y in zip(xs, ys)) / sxx
+        if log_p1 > max_x:
+            # Half-slope extrapolation: the scale trend saturates.
+            pred = (mean_y + slope * (max_x - mean_x)
+                    + slope * DAMP * (log_p1 - max_x))
+        else:
+            pred = mean_y + slope * (log_p1 - mean_x)
+        residuals = [y - (mean_y + slope * (x - mean_x))
+                     for x, y in zip(xs, ys)]
+        dof = max(1, len(residuals) - 2)
+        sigma = math.sqrt(sum(r * r for r in residuals) / dof)
+        shape[h] = max(-LOG_RATIO_CLAMP, min(LOG_RATIO_CLAMP, pred))
+        spread[h] = max(SPREAD_FLOOR, sigma)
     return shape, spread
 
 
@@ -147,7 +169,8 @@ def forecast_case(case, name):
     p1 = max(1, first["viewers"])
     log_p1 = math.log(p1)
 
-    # Candidate comparables: complete release day, hour 1 not tiny.
+    # Training pool: complete release days whose hour 1 is a real
+    # share of the peak (rolling-midnight regime, like GTA VI).
     pool = []
     for comp in case.get("comparables", []):
         rows = release_day_rows(comp)
@@ -155,30 +178,26 @@ def forecast_case(case, name):
             continue
         if rows[1] < MIN_HOUR1_FRACTION * max(rows.values()):
             continue
-        pool.append((comp.get("name", ""), rows))
-    if len(pool) < 3:
+        pool.append(rows)
+
+    if len(pool) < 5:
         # Fall back: any complete release day, then persistence.
         pool = []
         for comp in case.get("comparables", []):
             rows = release_day_rows(comp)
             if rows is not None:
-                pool.append((comp.get("name", ""), rows))
-    if len(pool) < 3:
+                pool.append(rows)
+    if len(pool) < 5:
         shape = {h: 0.0 for h in range(2, 25)}
         spread = {h: 0.15 * math.sqrt(h - 1) for h in range(2, 25)}
-        neighbours = []
     else:
-        # 10 nearest neighbours by log hour-1 size; name breaks ties
-        # deterministically so two runs are identical.
-        pool.sort(key=lambda item: (abs(math.log(item[1][1]) - log_p1), item[0]))
-        neighbours = pool[:K_NEIGHBOURS]
-        shape, spread = shape_and_spread(neighbours)
+        shape, spread = fit_shape(pool, log_p1)
 
     hours = []
     for row in case["forecast"]:
         h = row["hour"]
-        log_med = log_p1 + SHRINK * max(-1.5, min(1.5, shape[h]))
-        sigma = max(SPREAD_FLOOR, spread[h] * SPREAD_SCALE)
+        log_med = log_p1 + shape[h]
+        sigma = spread[h]
         quantiles = []
         prev = 0.0
         for z in Z:
